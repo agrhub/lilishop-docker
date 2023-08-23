@@ -1,0 +1,187 @@
+version: '3'
+services: 
+  lilishop-mysql:
+    image: mysql:8.0.25
+    restart: always
+    container_name: lilishop-mysql
+    volumes:
+      - ./mysql/data:/var/lib/mysql
+      - ./mysql/mysql-files:/var/lib/mysql-files
+      - ./mysql/my.cnf:/etc/my.cnf
+      - ./mysql/initdb:/docker-entrypoint-initdb.d
+    environment:
+      - "MYSQL_ROOT_PASSWORD=lilishop"
+      - "MYSQL_DATABASE=lilishop"
+      - "TZ=Asia/Ho_Chi_Minh"
+    ports:
+      - 3306:3306
+
+  lilishop-phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: lilishop-phpmyadmin
+    links:
+      - lilishop-mysql
+    depends_on:
+      - lilishop-mysql
+    environment:
+      PMA_HOST: lilishop-mysql
+      PMA_PORT: 3306
+      PMA_ARBITRARY: 1
+    restart: always
+    ports:
+      - 8081:80
+
+  lilishop-minio:
+    image: minio/minio
+    container_name: lilishop-minio
+    restart: always
+    command: server /data
+    ports:
+      - 9000:9000
+    volumes:
+      - ./minio/data:/data
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=admin123456
+
+  lilishop-redis:
+    image: redis:6.2.5
+    restart: always
+    container_name: lilishop-redis
+    ports:
+      - 6379:6379
+    volumes: 
+      - ./redis/data:/data
+    command: redis-server --port 6379 --requirepass lilishop --appendonly yes
+
+  lilishop-elasticsearch:
+    image: elasticsearch:7.3.0
+    restart: always
+    container_name: lilishop-elasticsearch
+    volumes:
+      - ./elasticsearch/logs:/usr/share/es7/logs:rw
+      - ./elasticsearch/data:/usr/share/es7/data:rw
+      - ./elasticsearch/ik:/usr/share/elasticsearch/plugins/ik
+        #      - "./elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml"
+    ports: 
+      - "9200:9200"
+      - "9300:9300"
+    environment:
+      cluster.name: elasticsearch
+      discovery.type: single-node
+      ES_JAVA_OPTS: -Xms256m -Xmx256m
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+    networks: 
+      - stack
+    ulimits:
+      nofile:
+          soft: 65535
+          hard: 65535
+
+  lilishop-kibana:
+    image: docker.elastic.co/kibana/kibana:7.3.0
+    restart: always
+    container_name: lilishop-kibana
+    ports:
+      - 5601:5601
+    # volumes:
+            #    - "./config/kibana.yml:/usr/share/kibana/config/kibana.yml"
+    networks: 
+      - stack
+    depends_on: ['lilishop-elasticsearch']  
+
+
+  lilishop-logstash:
+    image: logstash:7.3.0
+    restart: always
+    container_name: lilishop-logstash
+    volumes:
+      - ./logstash/logstash-springboot.conf:/usr/share/logstash/pipeline/logstash.conf #挂载logstash的配置文件
+      - ./logstash/lili_goods.json:/usr/share/logstash/templates/lili_goods.json
+    networks: 
+      - stack
+    depends_on: ['lilishop-elasticsearch']
+    ports: 
+      - 4560:4560
+    
+  # rocket mq name server
+  lilishop-rmqnamesrv:
+    image: foxiswho/rocketmq:server-4.7.0
+    restart: always
+    container_name: lilishop-rocket-server
+    environment:
+      JAVA_OPT_EXT: "-Duser.home=/home/rocketmq -Xms64M -Xmx64M -Xmn128m"
+    volumes:
+      - ./rocketmq/namesrv/logs:/home/rocketmq/logs
+      - ./rocketmq/namesrv/store:/home/rocketmq/store
+    networks:
+      - rocketmq
+    ports:
+      - 9876:9876
+
+  # rocket mq broker
+  lilishop-rmqbroker:
+    image: foxiswho/rocketmq:broker-4.7.0
+    restart: always
+    container_name: lilishop-rocket-broker
+    volumes:
+      # must change mod 777 for folders: log, store, conf
+      - ./rocketmq/broker/logs:/home/rocketmq/logs
+      - ./rocketmq/broker/store:/home/rocketmq/store
+      - ./rocketmq/broker/conf/broker.conf:/etc/rocketmq/broker.conf
+    environment:
+      - JAVA_HOME=/usr/lib/jvm/jre
+      - NAMESRV_ADDR=lilishop-rmqnamesrv:9876
+      - JAVA_OPTS:=-Duser.home=/home/rocketmq
+      - JAVA_OPT_EXT=-server -Xms64m -Xmx64m -Xmn64m
+    command: mqbroker -c /etc/rocketmq/broker.conf
+    depends_on:
+      - lilishop-rmqnamesrv
+    links:
+      - lilishop-rmqnamesrv
+    networks:
+      - rocketmq
+    ports:
+      - 10909:10909
+      - 10911:10911
+
+  # rocket console 这个可以不需要
+  lilishop-rmqconsole:
+    image: styletang/rocketmq-console-ng:latest
+    restart: always
+    container_name: lilishop-rocket-console
+    environment:
+      - JAVA_OPTS=-Drocketmq.config.namesrvAddr=lilishop-rmqnamesrv:9876 -Dserver.port=8180 -Drocketmq.config.isVIPChannel=false
+      - JAVA_OPT_EXT=-Xms128m -Xmx128m -Xmn128m
+    depends_on:
+      - lilishop-rmqnamesrv
+    links:
+      - lilishop-rmqnamesrv
+    networks:
+      - rocketmq
+    ports:
+      - 8180:8180
+      
+  # xxl-job 分布式调度中心
+  lilishop-xxl-job:
+    image: xuxueli/xxl-job-admin:2.3.0
+    restart: always
+    container_name: lilishop-xxl-job
+    # network_mode: host
+    environment:
+      - PARAMS=--spring.datasource.url=jdbc:mysql://10.240.0.89:3306/lilishop?Unicode=true&characterEncoding=UTF-8  --spring.datasource.username=root --spring.datasource.password=lilishop --server.port=9001
+    depends_on:
+      - lilishop-mysql
+    volumes:
+      - ./xxl-job/logs:/data/applogs
+    ports:
+      - 9001:9001
+networks: 
+  rocketmq:
+    driver: bridge
+  stack:
+    driver: bridge
+
